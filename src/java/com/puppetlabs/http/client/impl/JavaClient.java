@@ -249,7 +249,8 @@ public class JavaClient {
                     if (headers.get("content-type") != null) {
                         contentType = ContentType.parse(headers.get("content-type"));
                     }
-                    if (requestOptions.getAs() != ResponseBodyType.STREAM) {
+                    if (requestOptions.getAs() != ResponseBodyType.STREAM &&
+                            requestOptions.getAs() != ResponseBodyType.UNBUFFERED_STREAM) {
                         body = coerceBodyType((InputStream)body, requestOptions.getAs(), contentType);
                     }
                     deliverResponse(requestOptions,

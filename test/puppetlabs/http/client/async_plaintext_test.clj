@@ -1,8 +1,11 @@
 (ns puppetlabs.http.client.async-plaintext-test
-  (:import (com.puppetlabs.http.client Async RequestOptions ClientOptions)
+  (:import (com.puppetlabs.http.client Async RequestOptions ClientOptions ResponseBodyType)
            (org.apache.http.impl.nio.client HttpAsyncClients)
-           (java.net URI SocketTimeoutException ServerSocket))
+           (java.net URI SocketTimeoutException ServerSocket)
+           (java.io PipedInputStream PipedOutputStream)
+           (java.util.concurrent TimeoutException))
   (:require [clojure.test :refer :all]
+            [clojure.java.io :as io]
             [puppetlabs.http.client.test-common :refer :all]
             [puppetlabs.trapperkeeper.core :as tk]
             [puppetlabs.trapperkeeper.testutils.bootstrap :as testutils]
@@ -11,7 +14,8 @@
             [puppetlabs.trapperkeeper.services.webserver.jetty9-service :as jetty9]
             [puppetlabs.http.client.common :as common]
             [puppetlabs.http.client.async :as async]
-            [schema.test :as schema-test]))
+            [schema.test :as schema-test]
+            [clojure.tools.logging :as log]))
 
 (use-fixtures :once schema-test/validate-schemas)
 
@@ -353,3 +357,93 @@
               (let [response @(common/get client url {:as :text})]
                 (is (= 200 (:status response)))
                 (is (= "Hello, World!" (:body response)))))))))))
+
+(defn- build-content-handler
+  [data initial-bytes-read? server-side-failure?]
+  (fn [_]
+    (let [outstream (PipedOutputStream.)
+          instream (PipedInputStream.)
+          _ (.connect instream outstream)
+          outwriter (io/make-writer outstream {})]
+      (future
+       (.write outwriter data)
+       (if server-side-failure?
+         (throw (Exception. "Server side failure!")))
+       ; Block until the client confirms it has read the first few bytes
+       (if initial-bytes-read?
+         (do
+           (deref initial-bytes-read? 1000 :timeout)
+           (is (realized? initial-bytes-read?))
+           (if-not (realized? initial-bytes-read?) (println "================>>>> FAIL!")))) ;FIXME delete this
+       ; Write the last of the data
+       (.write outwriter "lastfewbytes")
+       (.close outwriter))
+      {:status 200
+       :body   instream})))
+
+(defn- java-request
+  [port as decompress?]
+  (let [request-options (-> (str "http://localhost:" port "/hello")
+                            RequestOptions.
+                            (.setAs (case as
+                                      :stream ResponseBodyType/STREAM
+                                      :unbuffered-stream ResponseBodyType/UNBUFFERED_STREAM))
+                            (.setDecompressBody decompress?))
+        client-options (-> (ClientOptions.) (.setSocketTimeoutMilliseconds 1000))]
+    (with-open [client (Async/createClient client-options)]
+      (let [response (-> (.get client request-options) .deref)]
+        {:status (.getStatus response)
+         :body   (.getBody response)
+         :error  (.getError response)}))))
+
+(defn- clojure-request
+  [port as decompress?]
+  (with-open [client (async/create-client {:socket-timeout-milliseconds 1000})]
+    @(common/get
+      client
+      (str "http://localhost:" port "/hello")
+      {:as              as
+       :decompress-body decompress?})))
+
+(defn- do-request
+  [test-type port as decompress?]
+  (case test-type
+    :clojure (clojure-request port as decompress?)
+    :java (java-request port as decompress?)))
+
+(deftest clojure-async-test-client-options
+  (testing "can read bytes from stream before response is complete"
+    (let [data (apply str (repeat (* 1024 1024) "fooo"))]
+      (testlogging/with-test-logging
+       (doseq [as [:stream :unbuffered-stream]
+               decompress? [false true]
+               server-side-failure? [false true]
+               test-type [:clojure :java]]
+         (println (str "persistent async client (" test-type ", " as ", decompress=" decompress? ", failure=" server-side-failure?)) ;;FIXME
+         (testing (str "persistent async client (" test-type ", " as ", decompress=" decompress? ", failure=" server-side-failure?)
+           (let [initial-bytes-read? nil #_(if (= as :unbuffered-stream) (promise) nil)] ;;FIXME
+             (try
+               (testwebserver/with-test-webserver-and-config
+                (build-content-handler data initial-bytes-read? server-side-failure?) port {:shutdown-timeout-seconds 1}
+                (let [{:keys [status body error]} (do-request test-type port as decompress?)]
+                  (if server-side-failure?
+                    (do
+                      (is error)
+                      (is (instance? SocketTimeoutException error)))
+                    (do
+                      (is (= 200 status))
+                      (let [instream body
+                            buf (make-array Byte/TYPE 12)
+                            _ (.read instream buf)]
+                        ;; make sure we can read a few chars off of the stream
+                        (is (= "fooofooofooo" (String. buf "UTF-8")))
+                        ;; indicate we read some chars
+                        (if initial-bytes-read? (deliver initial-bytes-read? true))
+                        ;; read the rest and validate the content
+                        (let [final-string (str "fooofooofooo" (slurp instream))]
+                          (is (= (str data "lastfewbytes") final-string))))))))
+               (catch TimeoutException e
+                 ;; Expected whenever there's a server-side failure that doesn't close the socket
+                 (if-not server-side-failure? (throw e)))
+               (catch Exception e (.printStackTrace e))
+               ))))))))

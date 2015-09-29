@@ -249,7 +249,8 @@
       (try
         (let [response (cond-> (response-map opts http-response)
                                (:decompress-body opts) (decompress)
-                               (not= :stream (:as opts)) (coerce-body-type))]
+                               (and (not= :stream (:as opts))
+                                    (not= :unbuffered-stream (:as opts))) (coerce-body-type))]
           (deliver-result result opts callback response))
         (catch Exception e
           (log/warn e "Error when delivering response")
